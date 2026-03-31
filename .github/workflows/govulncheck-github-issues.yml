@@ -1,0 +1,267 @@
+name: Govulncheck to GitHub Issues
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight
+  workflow_dispatch:
+
+jobs:
+  # Job 1: Load list of repositories
+  load-targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout Configuration
+        uses: actions/checkout@v6
+
+      - name: Load Repository List
+        id: set-matrix
+        run: |
+          if [ ! -f repositories.json ]; then
+            echo "::error::repositories.json not found."
+            exit 1
+          fi
+          # Read the JSON file and output it as a compact string for the matrix
+          MATRIX_JSON=$(jq -c . repositories.json)
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+
+  # Job 2: Scan repositories in parallel (Fan-Out)
+  scan-repository:
+    needs: load-targets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJson(needs.load-targets.outputs.matrix) }}
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Prepare Artifact Name
+        run: |
+          SAFE_NAME=$(echo "${{ matrix.repo.name }}/${{ matrix.repo.branch }}" | tr '/' '-')
+          echo "REPO_SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+
+      - name: Scan Repository and Generate Report
+        env:
+          TARGET_REPO: ${{ matrix.repo.name }}
+          TARGET_BRANCH: ${{ matrix.repo.branch }}
+        run: |
+          echo "------------------------------------------------------"
+          echo "Scanning: $TARGET_REPO (Branch: $TARGET_BRANCH)"
+          echo "------------------------------------------------------"
+
+          # 1. Clone the target repository on the specified branch
+          git clone --depth 1 --branch "$TARGET_BRANCH" "https://github.com/$TARGET_REPO.git" target-source || { echo "Failed to clone $TARGET_REPO on branch $TARGET_BRANCH"; exit 1; }
+
+          pushd target-source > /dev/null
+          govulncheck -format json ./... > ../govuln-stream.json || true
+          popd > /dev/null
+
+          # Prepare default empty report if govulncheck produced no output
+          if [ ! -s govuln-stream.json ]; then
+            echo "{\"repo\": \"$TARGET_REPO\", \"findings\": []}" > "report-${REPO_SAFE_NAME}.json"
+            exit 0
+          fi
+
+          # 2. Consolidate and Pre-process Data
+          # Merge streaming output into a structured list of unique vulnerabilities
+          jq -s '
+            # Create a lookup map for OSV definitions { "GO-202X-XXXX": { ... } }
+            ([ .[] | select(.osv != null) | {key: .osv.id, value: .osv} ] | from_entries) as $osv_defs
+            | 
+            # Filter findings that have a trace with a position
+            [ .[] | select(.finding.trace[]?.position != null) ]
+            # Group by Vulnerability ID to combine multiple traces for the same issue
+            | group_by(.finding.osv)
+            | map({
+                id: .[0].finding.osv,
+                # Associate the fixed version with the vulnerable dependency module
+                fixed_versions: ([ .[] | select(.finding.fixed_version != null and .finding.fixed_version != "") | "\(.finding.fixed_version) (module: \(.finding.trace[0].module // "unknown"))" ] | if length > 0 then unique | join(", ") else "N/A" end),
+                summary: ($osv_defs[.[0].finding.osv].summary // "No summary available"),
+                details: ($osv_defs[.[0].finding.osv].details // "No details available"),
+                # Extract vulnerable dependency module and version
+                dependencies: (map(.finding.trace[]? | select(.version != null and .version != "") | "\(.module)@\(.version)") | unique | join(", ")),
+                # Collect unique traces (file, line, function)
+                traces: (map(.finding.trace[]? | select(.position != null) | {
+                  file: .position.filename,
+                  line: .position.line,
+                  func: .function
+                }) | unique)
+              })
+          ' govuln-stream.json > vulnerabilities.json
+
+          # 3. Generate Findings Stream (Optimized Loop)
+          # Initialize the final findings array
+          echo "[]" > findings.json
+
+          # Iterate over vulnerabilities and verify file existence
+          jq -c '.[]' vulnerabilities.json | while read -r VULN; do
+            ID=$(echo "$VULN" | jq -r '.id')
+            FIXED_VERSIONS=$(echo "$VULN" | jq -r '.fixed_versions')
+            SUMMARY=$(echo "$VULN" | jq -r '.summary')
+            DETAILS=$(echo "$VULN" | jq -r '.details')
+            DEPENDENCIES=$(echo "$VULN" | jq -r '.dependencies')
+            
+            if [ -z "$DEPENDENCIES" ] || [ "$DEPENDENCIES" = "null" ]; then
+                DEPENDENCIES="Unknown"
+            fi
+            
+            POSITIONS=""
+            
+            # Check if referenced files exist in the cloned repo
+            # We use a separate stream processing here to avoid subshell variable loss
+            POSITIONS=$(echo "$VULN" | jq -c '.traces[]' | while read -r TRACE; do
+              FNAME=$(echo "$TRACE" | jq -r '.file')
+              LINE=$(echo "$TRACE" | jq -r '.line')
+              FUNC=$(echo "$TRACE" | jq -r '.func')
+              
+              if [ -f "target-source/$FNAME" ]; then
+                 echo "- \`$FNAME:$LINE\` (Function: \`$FUNC\`)"
+              fi
+            done)
+
+            # If no positions were found within the repo source (e.g. only in deps), skip or mark generic
+            if [ -z "$POSITIONS" ]; then
+                POSITIONS="_No specific lines in the scanned source code were identified (vulnerability likely in dependencies)._"
+            fi
+
+            TITLE="Security: $ID in $TARGET_REPO/$TARGET_BRANCH"
+            
+            # Construct the Markdown Body
+            BODY=$(cat <<EOF
+          ### govulncheck Finding (REACHABLE)
+          - **Target Repository:** [$TARGET_REPO](https://github.com/$TARGET_REPO) (Branch: \`$TARGET_BRANCH\`)
+          - **Vulnerability ID:** [$ID](https://pkg.go.dev/vuln/$ID)
+          - **Vulnerable Dependency:** \`$DEPENDENCIES\`
+          - **Fixed In:** \`$FIXED_VERSIONS\`
+          
+          ### Summary
+          $SUMMARY
+
+          ### Details
+          $DETAILS
+
+          ### Affected Locations
+          $POSITIONS
+
+          ---
+          *Note: govulncheck has confirmed that the source code in $TARGET_REPO contains a reachable call path to this vulnerability.*
+          *Last Updated: $(date)*
+          EOF
+          )
+            # Output single JSON object to stdout
+            jq -n --arg id "$ID" --arg title "$TITLE" --arg body "$BODY" \
+               '{id: $id, title: $title, body: $body}'
+          done > findings.jsonl
+
+          # 4. Finalize Report
+          # Slurp the JSONL stream into a single JSON array
+          jq -s --arg repo "$TARGET_REPO" --arg branch "$TARGET_BRANCH" '{repo: $repo, branch: $branch, findings: .}' findings.jsonl > "report-${REPO_SAFE_NAME}.json"
+
+      - name: Upload Findings Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: findings-${{ env.REPO_SAFE_NAME }}
+          path: report-${{ env.REPO_SAFE_NAME }}.json
+          retention-days: 1
+
+  # Job 3: Report Findings (Sequential Fan-In)
+  report-findings:
+    needs: scan-repository
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: findings-*
+          path: all-findings
+          merge-multiple: true
+
+      - name: Sync Issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPORT_REPO: ${{ github.repository }}
+        run: |
+          # Ensure base labels exist
+          gh label create "security" --repo "$REPORT_REPO" --color "d73a4a" --description "Security related issue" --force 2>/dev/null || true
+          gh label create "govulncheck" --repo "$REPORT_REPO" --color "0052cc" --description "Found by govulncheck" --force 2>/dev/null || true
+          gh label create "vulnerability" --repo "$REPORT_REPO" --color "d93f0b" --description "A security vulnerability" --force 2>/dev/null || true
+
+          # Initialize tracking file for active issues once
+          > active_issue_numbers.txt
+
+          # Process all reports
+          for REPORT_FILE in all-findings/*.json; do
+            # Skip if no files match
+            [ -e "$REPORT_FILE" ] || continue
+
+            TARGET_REPO=$(jq -r '.repo' "$REPORT_FILE")
+            TARGET_BRANCH=$(jq -r '.branch' "$REPORT_FILE")
+            echo "======================================================"
+            echo "Processing findings for: $TARGET_REPO (Branch: $TARGET_BRANCH)"
+            echo "======================================================"
+
+            # Ensure dynamic location label exists and respects limits (name: 51 chars, description: 100 chars)
+            LOCATION_STR="$TARGET_REPO/$TARGET_BRANCH"
+            LOCATION_LABEL="${LOCATION_STR:0:51}"
+            DESC_STR="Vulnerabilities in $TARGET_REPO ($TARGET_BRANCH)"
+            DESC_TRUNC="${DESC_STR:0:100}"
+            
+            gh label create "$LOCATION_LABEL" --repo "$REPORT_REPO" --color "fbca04" --description "$DESC_TRUNC" --force 2>/dev/null || true
+
+            # 1. Fetch existing issues for this Target Repo
+            gh issue list \
+              --repo "$REPORT_REPO" \
+              --label "govulncheck" \
+              --search "\"in $TARGET_REPO\" in:title" \
+              --state open \
+              --json number,title > open_issues.json
+            
+            # 2. Process Findings
+            jq -c '.findings[]' "$REPORT_FILE" | while read -r FINDING; do
+              ID=$(echo "$FINDING" | jq -r '.id')
+              TITLE=$(echo "$FINDING" | jq -r '.title')
+              BODY=$(echo "$FINDING" | jq -r '.body')
+
+              EXISTING_NUMBER=$(jq -r --arg title "$TITLE" '.[] | select(.title == $title) | .number' open_issues.json | head -n 1)
+
+              if [ -n "$EXISTING_NUMBER" ] && [ "$EXISTING_NUMBER" != "null" ]; then
+                echo "  [UPDATE] Issue #$EXISTING_NUMBER ($ID)"
+                gh issue edit "$EXISTING_NUMBER" --repo "$REPORT_REPO" --title "$TITLE" --body "$BODY" --add-label "security" --add-label "govulncheck" --add-label "vulnerability" --add-label "$LOCATION_LABEL"
+                echo "$EXISTING_NUMBER" >> active_issue_numbers.txt
+              else
+                echo "  [CREATE] New Issue ($ID)"
+                NEW_ISSUE_URL=$(gh issue create --repo "$REPORT_REPO" --title "$TITLE" --body "$BODY" --label "security" --label "govulncheck" --label "vulnerability" --label "$LOCATION_LABEL")
+                NEW_ISSUE_NUM=$(basename "$NEW_ISSUE_URL")
+                echo "$NEW_ISSUE_NUM" >> active_issue_numbers.txt
+                sleep 1
+              fi
+            done
+
+            # 3. Close Stale Issues
+            jq -c '.[]' open_issues.json | while read -r OPEN_ISSUE; do
+              ISSUE_NUM=$(echo "$OPEN_ISSUE" | jq -r '.number')
+              ISSUE_TITLE=$(echo "$OPEN_ISSUE" | jq -r '.title')
+
+              # Ensure we only touch issues for the current repo and branch context
+              if [[ "$ISSUE_TITLE" != *"$TARGET_REPO/$TARGET_BRANCH"* ]]; then continue; fi
+
+              if ! grep -q "^$ISSUE_NUM$" active_issue_numbers.txt; then
+                echo "  [CLOSE] Issue #$ISSUE_NUM (Fixed)"
+                gh issue close "$ISSUE_NUM" --repo "$REPORT_REPO" --comment "Auto-closing: Vulnerability no longer detected in the latest scan of $TARGET_REPO (Branch: $TARGET_BRANCH)."
+                sleep 1
+              fi
+            done
+          done
